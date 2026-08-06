@@ -1,0 +1,158 @@
+# Airflow UI: localhost:8080 (admin/admin) | Warehouse: localhost:5433
+
+x-airflow-common: &airflow-common
+  # 'image' junto com 'build' faz o Compose construir uma vez só, em vez de
+  # uma vez por serviço do Airflow
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: hackernews-pipeline/airflow:2.9.3
+  # O Docker Desktop mascara a diferença de uid, mas no Linux o scheduler não
+  # sobe se não conseguir escrever em ./logs. Daí o AIRFLOW_UID: copie o
+  # .env.example para .env antes do primeiro up. Sem .env cai em 50000, que
+  # é o padrão da imagem.
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-meta/airflow
+    AIRFLOW__CORE__FERNET_KEY: "eniXRxEoqDwHbCdUKrC3qgRN9YQ5Mqz4GnZDPHShdqU="
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: "America/Sao_Paulo"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__WEBSERVER__SECRET_KEY: "hackernews-pipeline-secret-key"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./sql:/opt/airflow/sql
+  depends_on:
+    postgres-meta:
+      condition: service_healthy
+  networks:
+    - airflow-net
+
+services:
+  postgres-meta:
+    image: postgres:16
+    container_name: hackernews-meta-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-meta-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - airflow-net
+
+  # Warehouse separado do metadata DB: o Airflow não escreve dado de negócio
+  # no próprio banco de controle
+  postgres-hackernews:
+    image: postgres:16
+    container_name: hackernews-warehouse-db
+    environment:
+      POSTGRES_USER: hackernews
+      POSTGRES_PASSWORD: hackernews123
+      POSTGRES_DB: hackernewsdb
+    volumes:
+      - postgres-hackernews-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "hackernews", "-d", "hackernewsdb"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - airflow-net
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: hackernews-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname HackerNews \
+          --role Admin \
+          --email admin@hackernews.local \
+          --password admin
+        airflow connections delete postgres_hackernews 2>/dev/null || true
+        airflow connections add postgres_hackernews \
+          --conn-type postgres \
+          --conn-host postgres-hackernews \
+          --conn-login hackernews \
+          --conn-password hackernews123 \
+          --conn-schema hackernewsdb \
+          --conn-port 5432
+        airflow pools set hn_api_pool 4 "Limita a concorrência contra a API do Hacker News"
+        echo "=== Airflow pronto: http://localhost:8080 (admin/admin) ==="
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      postgres-hackernews:
+        condition: service_healthy
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: hackernews-airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$$HOSTNAME\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      postgres-hackernews:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: hackernews-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      postgres-meta:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-meta-data:
+  postgres-hackernews-data:
+
+networks:
+  airflow-net:
+    driver: bridge

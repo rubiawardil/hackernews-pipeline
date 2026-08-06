@@ -1,0 +1,26 @@
+# Airflow runtime
+logs/*
+!logs/.gitkeep
+airflow.db
+airflow.cfg
+webserver_config.py
+standalone_admin_password.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Environment (o .env.example fica versionado, é o modelo)
+.env
+.env.*
+!.env.example
+
+# Docker
+*.override.yml
+docker-compose.override.yml
+
+# OS
+.DS_Store
