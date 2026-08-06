@@ -1,4 +1,4 @@
-# Airflow UI: localhost:8080 (admin/admin) | Warehouse: localhost:5433
+# Airflow UI: localhost:8080 (admin/admin) | Streamlit: localhost:8501 | Warehouse: localhost:5433
 
 x-airflow-common: &airflow-common
   # 'image' junto com 'build' faz o Compose construir uma vez só, em vez de
@@ -148,6 +148,31 @@ services:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
+
+  # Só depende do warehouse: o dashboard lê as tabelas Gold, não fala com o
+  # Airflow. Sobe junto e mostra os painéis vazios até a primeira execução.
+  streamlit:
+    build:
+      context: ./streamlit
+      dockerfile: Dockerfile
+    image: hackernews-pipeline/streamlit:1.0
+    container_name: hackernews-streamlit
+    environment:
+      WAREHOUSE_HOST: postgres-hackernews
+      WAREHOUSE_PORT: "5432"
+      WAREHOUSE_DB: hackernewsdb
+      WAREHOUSE_USER: hackernews
+      WAREHOUSE_PASSWORD: hackernews123
+    volumes:
+      - ./streamlit:/app
+    ports:
+      - "8501:8501"
+    depends_on:
+      postgres-hackernews:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - airflow-net
 
 volumes:
   postgres-meta-data:
