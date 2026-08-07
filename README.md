@@ -14,7 +14,6 @@ Todo conteúdo do site é exposto por uma **API pública, gratuita e sem autenti
 
 A API trata tudo como *item*, e cada item tem um `type`. Os campos que importam para este projeto:
 
-
 | Campo              | O que é                                                                                |
 | ------------------ | -------------------------------------------------------------------------------------- |
 | `type`             | `story` (um link postado), `job` (vaga divulgada pela Y Combinator), `comment`, `poll` |
@@ -24,7 +23,6 @@ A API trata tudo como *item*, e cada item tem um `type`. Os campos que importam 
 | `time`             | Data de publicação                                                                     |
 | `url`              | Link externo apontado pelo post                                                        |
 | `dead` / `deleted` | Flags de moderação (o post foi derrubado ou removido)                                  |
-
 
 Os endpoints usados pelo pipeline, todos sob `https://hacker-news.firebaseio.com/v0`:
 
@@ -59,7 +57,57 @@ A DAG roda a cada 15 minutos e executa 16 tasks. Em linhas gerais:
 
 ## Arquitetura
 
-[WIP]
+A organização segue a arquitetura Medalhão, com um schema por camada no PostgreSQL.
+
+### Camada Bronze — `bronze.item_versions`
+
+Guarda o payload JSON bruto, exatamente como veio da API, sem nenhuma transformação. A chave primária é o par `(item_id, payload_hash)`, e a escrita usa `INSERT ... ON CONFLICT DO NOTHING`.
+
+Se um item não mudou desde a última execução, o hash calculado é idêntico ao que já está gravado, o conflito acontece e nada é escrito. Se o item mudou, o hash muda, uma linha nova entra e **a versão anterior continua ali**. É assim que o histórico se forma.
+
+O `RETURNING` da query devolve só as linhas que realmente entraram, e é contando essas linhas que a task sabe quantas versões novas gravou de verdade.
+
+### Camada Silver — `silver.stories`
+
+Um registro por post, sempre no estado mais recente conhecido. Aqui os dados saem do JSON e viram colunas tipadas: `score` e `descendants` como inteiros, `posted_at` como timestamp, `is_dead` e `is_deleted` como booleanos, e o domínio extraído da URL por expressão regular.
+
+A escrita é um `INSERT ... ON CONFLICT (item_id) DO UPDATE`, com uma condição que julgamos importante:
+
+```sql
+WHERE EXCLUDED.captured_at > silver.stories.captured_at
+```
+
+Sem essa cláusula, uma execução atrasada poderia sobrescrever um dado mais novo com um mais velho. É um erro clássico de pipeline incremental e custa uma linha evitá-lo.
+
+### Camada Gold — cinco tabelas
+
+Todas reconstruídas do zero a cada execução, com `TRUNCATE` seguido de `INSERT ... SELECT` dentro de uma transação. Reconstrução determinística é a forma mais simples de garantir idempotência nessa camada: não importa quantas vezes rodar, o resultado é função apenas do estado atual do Silver e do Bronze.
+
+
+| Tabela                  | O que tem dentro                                                           |
+| ----------------------- | -------------------------------------------------------------------------- |
+| `gold.current_ranking`  | Top 100 posts vivos por score, com idade em horas e score por hora         |
+| `gold.score_velocity`   | A trajetória de score e comentários de cada post, versão por versão        |
+| `gold.top_domains`      | Os 50 domínios mais postados, com score médio, mediana e máximo            |
+| `gold.hourly_activity`  | Volume de publicação e score médio por hora do dia, últimos 7 dias         |
+| `gold.moderation_stats` | Posts derrubados pela moderação e quanto tempo levaram até serem flagrados |
+
+
+A `score_velocity` é a que mais gostamos, porque ela só é possível por causa do CDC. A API não devolve esse histórico em lugar nenhum, ele existe apenas porque o Bronze acumulou as versões.
+
+A `moderation_stats` tem um detalhe que só descobrimos testando contra a API de verdade: quando um post é moderado, a API **apaga** os campos do payload. Dos 32 itens `dead` que amostramos, nenhum ainda tinha `title`. Por isso essa tabela não lê a versão mais recente do post, e sim a última versão anterior à moderação, a última em que os dados ainda existiam.
+
+### Camada Control — `control.run_log` e `control.dq_results`
+
+Não faz parte do Medalhão, mas achamos que faltava algo para responder se a execução funcionou sem depender só da interface do Airflow. O `run_log` guarda uma linha por execução com status, duração e as contagens de cada etapa. O `dq_results` guarda o resultado de cada checagem de qualidade.
+
+As checagens são cinco:
+
+1. Nenhum `item_id` duplicado no Silver.
+2. Nenhum post com score negativo ou data de publicação no futuro.
+3. O catálogo não encolheu em relação à execução anterior.
+4. Toda linha do Silver tem correspondência no Bronze.
+5. A tabela `gold.current_ranking` não está vazia.
 
 ## Ferramentas e por que escolhemos cada uma
 
@@ -168,11 +216,71 @@ O `-v` é o único que apaga dado. Use ele quando quiser testar a subida do zero
 
 ## Como conferir que está funcionando
 
-[WIP]
+### Contagem por camada
+
+Criamos uma view que resume tudo de uma vez:
+
+```sql
+SELECT * FROM control.v_layer_counts;
+```
+
+### Histórico das execuções
+
+```sql
+SELECT * FROM control.v_recent_runs;
+SELECT check_name, passed, observed FROM control.dq_results
+ WHERE run_id = (SELECT run_id FROM control.run_log ORDER BY started_at DESC LIMIT 1);
+```
+
+### Teste de idempotência
+
+1. Anote os números de `control.v_layer_counts`.
+2. Na interface do Airflow, abra uma execução já concluída e clique em **Clear** para reexecutá-la inteira.
+3. Espere terminar e consulte a view de novo.
+
+O `silver.stories` não ganha linha duplicada, e o Bronze só cresce se algum post realmente mudou de score entre a primeira tentativa e a segunda, o que é mudança de verdade capturada, não duplicação. A checagem de qualidade número 1, que compara total contra distintos no Silver, continua passando.
 
 ## Decisões técnicas
 
-[WIP]
+### Detectar mudança por hash, já que não existe timestamp na origem
+
+Como a API não expõe "última modificação", calculamos um SHA-256 sobre um subconjunto do payload:
+
+```python
+MUTABLE_FIELDS = ("score", "title", "url", "descendants", "dead", "deleted", "text")
+```
+
+Só entram no hash os campos que mudam depois da publicação. Os demais ficam de fora de propósito: o campo `kids`, por exemplo, é a lista de IDs dos comentários e muda toda hora, mas quem já representa esse movimento é o `descendants`. Incluir `kids` faria praticamente todo item virar versão nova a cada execução, e o Bronze cresceria sem trazer informação.
+
+O hash é ordenado por chave antes de ser calculado (`sort_keys=True`), então a ordem em que a API devolve os campos não interfere.
+
+### Por que `ON CONFLICT` em vez de apagar e reinserir
+
+No CDC o Bronze precisa **acumular** versões, não substituí-las. Se apagássemos as linhas da execução anterior, destruiríamos justamente o histórico que dá sentido ao projeto.
+
+### O `DISTINCT ON` no Silver
+
+Esse foi um bug real que só apareceu quando testamos o cenário de reexecução com atenção.
+
+Quando uma execução é limpa e rodada de novo, ela mantém o mesmo `dag_run_id`. Se o score de algum post mudou entre a primeira tentativa e a segunda, o hash muda e o Bronze ganha uma segunda linha **com o mesmo** `dag_run_id`. Aí o `SELECT` do Silver, que filtra por `dag_run_id`, passa a devolver duas linhas para o mesmo `item_id`, e o Postgres retorna erro.
+
+A correção foi usar `DISTINCT ON (b.item_id)` com `ORDER BY b.captured_at DESC`, ficando só com a captura mais recente de cada item.
+
+### Retry em duas camadas
+
+O cliente HTTP tem retry próprio, com backoff, para os códigos 429, 500, 502, 503 e 504. Isso resolve a falha momentânea de uma requisição sem envolver o orquestrador. Acima dele, o Airflow tem `retries=3` com backoff exponencial, que cobre a task inteira falhando.
+
+Além disso, na busca de detalhes, um item que falha sozinho é registrado no log e descartado. Perder um post entre setecentos não justifica derrubar a execução.
+
+### O `finalize_run` fecha o registro mesmo quando algo falha
+
+A última task usa `trigger_rule="all_done"`, então ela roda independentemente do que aconteceu antes. Ela consulta o estado das outras tasks da execução, decide se o status é sucesso ou falha e grava as contagens.
+
+Como rede de segurança adicional, o `on_failure_callback` da DAG também fecha o registro, para o caso de a execução inteira morrer antes de chegar na task de fechamento, que foi exatamente o que aconteceu na execução que estourou o timeout. Esse callback só mexe na linha se ela ainda estiver como `running`, para não sobrescrever um fechamento já feito.
+
+### Pool para não martelar a API
+
+As tasks que falam com a API rodam dentro de um pool com 4 slots. Somado ao `max_active_runs=1`, isso garante que nunca haja mais de uma execução ativa nem uma enxurrada de requisições simultâneas contra um serviço público e gratuito.
 
 ## Estrutura do repositório
 
@@ -206,4 +314,3 @@ hackernews-pipeline/
     ├── inspect_warehouse.py        resumo das camadas pelo terminal
     └── test_hn_client.py           testa o cliente sem subir o Airflow
 ```
-
