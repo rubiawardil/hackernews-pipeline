@@ -4,6 +4,10 @@ Pipeline de dados com CDC e arquitetura Medalhão sobre a API pública do Hacker
 
 **Stack:** Apache Airflow 2.9.3 · PostgreSQL 16 · Streamlit · Docker Compose
 
+## Apresentação em vídeo
+
+Vídeo disponível no link: https://drive.google.com/drive/folders/1aR4KcDQpE70QlK_6g7R70NtneRSeCuwC?usp=drive_link
+
 ## O Hacker News e o problema
 
 ### O que é o Hacker News
